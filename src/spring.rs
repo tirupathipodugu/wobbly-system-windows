@@ -1,213 +1,232 @@
-//! Spring-mass sim for window content deformation.
+//! Compiz-style wobbly model.
 //!
-//! A grid of control points covers the window surface. Each point tracks its
-//! own displacement from the rest position, with a spring back to that rest
-//! position and (optionally) soft constraints to neighbors so the mesh
-//! deforms as a connected sheet rather than independent particles.
-//!
-//! The main loop drives this once per frame with the window's current
-//! velocity. Target displacement is proportional to velocity; the spring
-//! follows that target with damping — same shape as our Svelte/JS version,
-//! promoted to a 2D grid.
+//! A 4×4 grid of masses covers the window. Each mass is tied to its four
+//! neighbours by springs that pull toward their rest *offset* (vector
+//! springs), so the sheet resists stretching and shearing alike. While
+//! dragging, the mass nearest the grab point is pinned to the window and the
+//! rest of the sheet trails behind it. After release every mass also gets a
+//! spring back to its rest spot, so the sheet jiggles and settles onto the
+//! window's final position. The drawn surface is a bicubic Bézier patch over
+//! the 16 masses — the same construction Compiz uses.
 
-use std::time::Instant;
+use windows::Win32::Foundation::RECT;
+
+/// Masses per side.
+pub const GRID: usize = 4;
+const N: usize = GRID * GRID;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SpringConfig {
+    /// Neighbour spring constant (1/s²). Higher = stiffer, less lag.
     pub stiffness: f32,
-    pub damping: f32,
-    /// Grid resolution. 6×6 is a reasonable floor; 10×10 is smoother.
-    pub cols: usize,
-    pub rows: usize,
-    /// Peak lag distance (pixels) at saturating velocity.
-    pub max_lag_px: f32,
-    /// Scale factor from pixels/ms velocity to lag pixels.
-    pub lag_scale: f32,
-    /// Neighbor coupling (0..1). 0 = independent particles, 1 = rigid sheet.
-    pub cohesion: f32,
+    /// Velocity damping (1/s). Lower = more jiggle after release.
+    pub friction: f32,
+    /// Pull back to the rest shape once the window is let go (1/s²).
+    pub settle_stiffness: f32,
 }
 
 impl Default for SpringConfig {
     fn default() -> Self {
         Self {
-            stiffness: 0.14,
-            damping: 0.78,
-            cols: 10,
-            rows: 10,
-            max_lag_px: 60.0,
-            lag_scale: 180.0,
-            cohesion: 0.35,
+            stiffness: 2500.0,
+            friction: 14.0,
+            settle_stiffness: 600.0,
         }
     }
 }
 
-/// A single grid point.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Point {
-    /// Rest position in [0,1]^2 (fraction of window size).
-    pub rest_x: f32,
-    pub rest_y: f32,
-    /// Current displacement (pixels).
-    pub dx: f32,
-    pub dy: f32,
-    /// Current velocity of the displacement spring.
-    pub dvx: f32,
-    pub dvy: f32,
+impl SpringConfig {
+    /// Defaults, overridable with WOBBLY_SPRING / WOBBLY_FRICTION /
+    /// WOBBLY_SETTLE so the feel can be tuned without a rebuild.
+    pub fn from_env() -> Self {
+        let read = |name: &str, default: f32| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(default)
+        };
+        let d = Self::default();
+        Self {
+            stiffness: read("WOBBLY_SPRING", d.stiffness),
+            friction: read("WOBBLY_FRICTION", d.friction),
+            settle_stiffness: read("WOBBLY_SETTLE", d.settle_stiffness),
+        }
+    }
 }
 
-pub struct SpringGrid {
-    pub config: SpringConfig,
-    pub points: Vec<Point>,
-    last_tick: Option<Instant>,
-    /// Smoothed window velocity (pixels/ms). Shared across all points — the
-    /// per-point target is derived from this plus distance-to-leading-edge.
-    pub smoothed_vx: f32,
-    pub smoothed_vy: f32,
+pub struct Model {
+    config: SpringConfig,
+    /// Rest position of each mass relative to the window's top-left.
+    rest: [[f32; 2]; N],
+    /// Current position of each mass in screen pixels.
+    pos: [[f32; 2]; N],
+    vel: [[f32; 2]; N],
+    /// Mass pinned to the window while dragging; None once released.
+    grabbed: Option<usize>,
 }
 
-impl SpringGrid {
-    pub fn new(config: SpringConfig) -> Self {
-        let mut points = Vec::with_capacity(config.cols * config.rows);
-        for r in 0..config.rows {
-            for c in 0..config.cols {
-                points.push(Point {
-                    rest_x: (c as f32) / (config.cols as f32 - 1.0),
-                    rest_y: (r as f32) / (config.rows as f32 - 1.0),
-                    ..Default::default()
-                });
+impl Model {
+    pub fn new(config: SpringConfig, rect: RECT, grab_x: i32, grab_y: i32) -> Self {
+        let w = (rect.right - rect.left) as f32;
+        let h = (rect.bottom - rect.top) as f32;
+        let mut rest = [[0.0; 2]; N];
+        let mut pos = [[0.0; 2]; N];
+        for r in 0..GRID {
+            for c in 0..GRID {
+                let i = r * GRID + c;
+                rest[i] = [
+                    w * c as f32 / (GRID - 1) as f32,
+                    h * r as f32 / (GRID - 1) as f32,
+                ];
+                pos[i] = [rect.left as f32 + rest[i][0], rect.top as f32 + rest[i][1]];
             }
         }
+
+        let dist2 = |p: &[f32; 2]| {
+            let dx = p[0] - grab_x as f32;
+            let dy = p[1] - grab_y as f32;
+            dx * dx + dy * dy
+        };
+        let grabbed = (0..N).min_by(|&a, &b| dist2(&pos[a]).total_cmp(&dist2(&pos[b])));
+
         Self {
             config,
-            points,
-            last_tick: None,
-            smoothed_vx: 0.0,
-            smoothed_vy: 0.0,
+            rest,
+            pos,
+            vel: [[0.0; 2]; N],
+            grabbed,
         }
     }
 
-    /// Feed the current window position in pixels. Updates smoothed velocity.
-    pub fn feed_position(&mut self, x: i32, y: i32) {
-        let now = Instant::now();
-        if let Some(prev) = self.last_tick {
-            let dt_ms = (now - prev).as_secs_f32() * 1000.0;
-            if dt_ms > 0.5 {
-                let raw_vx = (x as f32 - self.prev_x) / dt_ms;
-                let raw_vy = (y as f32 - self.prev_y) / dt_ms;
-                self.smoothed_vx = self.smoothed_vx * 0.6 + raw_vx * 0.4;
-                self.smoothed_vy = self.smoothed_vy * 0.6 + raw_vy * 0.4;
-            }
-        }
-        self.prev_x = x as f32;
-        self.prev_y = y as f32;
-        self.last_tick = Some(now);
+    pub fn release(&mut self) {
+        self.grabbed = None;
     }
 
-    /// Advance the spring sim one step.
-    pub fn step(&mut self) {
+    /// Advance the sim by `dt` seconds with the window's top-left at `origin`.
+    pub fn step(&mut self, dt: f32, origin: [f32; 2]) {
+        // Fixed small substeps keep the explicit integrator stable at any
+        // frame rate.
+        const MAX_SUBSTEP: f32 = 1.0 / 480.0;
+        let dt = dt.clamp(0.0, 0.05);
+        let steps = (dt / MAX_SUBSTEP).ceil().max(1.0) as usize;
+        let h = dt / steps as f32;
+        for _ in 0..steps {
+            self.substep(h, origin);
+        }
+    }
+
+    fn substep(&mut self, h: f32, origin: [f32; 2]) {
         let cfg = self.config;
-        let target_dx =
-            (-self.smoothed_vx * cfg.lag_scale).clamp(-cfg.max_lag_px, cfg.max_lag_px);
-        let target_dy =
-            (-self.smoothed_vy * cfg.lag_scale).clamp(-cfg.max_lag_px, cfg.max_lag_px);
-
-        // Trailing-edge points lag more. Weight is 0 at leading edge, 1 at trailing.
-        let (cols, rows) = (cfg.cols, cfg.rows);
-        let leading_x_fac = self.smoothed_vx.signum(); // -1 if moving left, +1 if right
-        let leading_y_fac = self.smoothed_vy.signum();
-
-        // Snapshot neighbors to apply cohesion without reading mid-mutation.
-        let snapshot: Vec<(f32, f32)> =
-            self.points.iter().map(|p| (p.dx, p.dy)).collect();
-
-        for r in 0..rows {
-            for c in 0..cols {
-                let idx = r * cols + c;
-                let p = &mut self.points[idx];
-
-                // Trailing-edge weighting: points away from the leading edge
-                // get the full target; points at the leading edge get 0.
-                let wx = if leading_x_fac >= 0.0 { 1.0 - p.rest_x } else { p.rest_x };
-                let wy = if leading_y_fac >= 0.0 { 1.0 - p.rest_y } else { p.rest_y };
-                let point_target_dx = target_dx * (0.3 + 0.7 * wx);
-                let point_target_dy = target_dy * (0.3 + 0.7 * wy);
-
-                let acc_x = (point_target_dx - p.dx) * cfg.stiffness;
-                let acc_y = (point_target_dy - p.dy) * cfg.stiffness;
-                p.dvx = (p.dvx + acc_x) * cfg.damping;
-                p.dvy = (p.dvy + acc_y) * cfg.damping;
-                p.dx += p.dvx;
-                p.dy += p.dvy;
-
-                // Cohesion: pull toward average of 4-neighborhood.
-                if cfg.cohesion > 0.0 {
-                    let mut sum_x = 0.0;
-                    let mut sum_y = 0.0;
-                    let mut n = 0.0;
-                    for (nr, nc) in &[(r.wrapping_sub(1), c), (r + 1, c), (r, c.wrapping_sub(1)), (r, c + 1)] {
-                        if *nr < rows && *nc < cols {
-                            let (ndx, ndy) = snapshot[*nr * cols + *nc];
-                            sum_x += ndx;
-                            sum_y += ndy;
-                            n += 1.0;
-                        }
+        let mut acc = [[0.0f32; 2]; N];
+        for r in 0..GRID {
+            for c in 0..GRID {
+                let i = r * GRID + c;
+                for (dr, dc) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let (nr, nc) = (r as i32 + dr, c as i32 + dc);
+                    if nr < 0 || nc < 0 || nr >= GRID as i32 || nc >= GRID as i32 {
+                        continue;
                     }
-                    if n > 0.0 {
-                        let avg_x = sum_x / n;
-                        let avg_y = sum_y / n;
-                        p.dx = p.dx * (1.0 - cfg.cohesion) + avg_x * cfg.cohesion;
-                        p.dy = p.dy * (1.0 - cfg.cohesion) + avg_y * cfg.cohesion;
+                    let j = nr as usize * GRID + nc as usize;
+                    for a in 0..2 {
+                        let stretch =
+                            (self.pos[j][a] - self.pos[i][a]) - (self.rest[j][a] - self.rest[i][a]);
+                        acc[i][a] += cfg.stiffness * stretch;
                     }
+                }
+                for a in 0..2 {
+                    if self.grabbed.is_none() {
+                        let target = origin[a] + self.rest[i][a];
+                        acc[i][a] += cfg.settle_stiffness * (target - self.pos[i][a]);
+                    }
+                    acc[i][a] -= cfg.friction * self.vel[i][a];
                 }
             }
         }
-    }
 
-    /// True when the mesh is close enough to rest that we can skip rendering.
-    pub fn at_rest(&self) -> bool {
-        const EPS: f32 = 0.08;
-        self.smoothed_vx.abs() < EPS
-            && self.smoothed_vy.abs() < EPS
-            && self.points.iter().all(|p| {
-                p.dx.abs() < EPS && p.dy.abs() < EPS && p.dvx.abs() < EPS && p.dvy.abs() < EPS
-            })
-    }
-
-    pub fn reset(&mut self) {
-        for p in &mut self.points {
-            p.dx = 0.0;
-            p.dy = 0.0;
-            p.dvx = 0.0;
-            p.dvy = 0.0;
+        for i in 0..N {
+            if Some(i) == self.grabbed {
+                self.pos[i] = [origin[0] + self.rest[i][0], origin[1] + self.rest[i][1]];
+                self.vel[i] = [0.0; 2];
+                continue;
+            }
+            for a in 0..2 {
+                self.vel[i][a] += acc[i][a] * h;
+                self.pos[i][a] += self.vel[i][a] * h;
+            }
         }
-        self.smoothed_vx = 0.0;
-        self.smoothed_vy = 0.0;
     }
 
-    prev_x: f32,
-    prev_y: f32,
+    /// True once every mass sits (and stays) on its rest spot.
+    pub fn at_rest(&self, origin: [f32; 2]) -> bool {
+        (0..N).all(|i| {
+            (0..2).all(|a| {
+                (self.pos[i][a] - origin[a] - self.rest[i][a]).abs() < 0.5
+                    && self.vel[i][a].abs() < 8.0
+            })
+        })
+    }
+
+    /// Screen position of the Bézier surface at (u, v) ∈ [0,1]².
+    pub fn surface(&self, u: f32, v: f32) -> [f32; 2] {
+        let bu = bernstein(u);
+        let bv = bernstein(v);
+        let mut out = [0.0; 2];
+        for r in 0..GRID {
+            for c in 0..GRID {
+                let w = bv[r] * bu[c];
+                let p = self.pos[r * GRID + c];
+                out[0] += w * p[0];
+                out[1] += w * p[1];
+            }
+        }
+        out
+    }
 }
 
-// Simple fields that aren't easy to express in the struct-level block above.
-#[cfg(any())] // marker so the compiler doesn't trip
-mod _unused {}
+fn bernstein(t: f32) -> [f32; GRID] {
+    let s = 1.0 - t;
+    [s * s * s, 3.0 * t * s * s, 3.0 * t * t * s, t * t * t]
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn grid_has_right_count() {
-        let g = SpringGrid::new(SpringConfig::default());
-        assert_eq!(g.points.len(), 100);
+    fn rect() -> RECT {
+        RECT { left: 100, top: 50, right: 900, bottom: 650 }
     }
 
     #[test]
-    fn settles_to_rest_without_motion() {
-        let mut g = SpringGrid::new(SpringConfig::default());
-        for _ in 0..200 {
-            g.step();
+    fn surface_matches_window_at_rest() {
+        let m = Model::new(SpringConfig::default(), rect(), 500, 60);
+        let p = m.surface(0.25, 0.5);
+        assert!((p[0] - 300.0).abs() < 0.01 && (p[1] - 350.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn far_corner_lags_while_dragging() {
+        let mut m = Model::new(SpringConfig::default(), rect(), 100, 50);
+        // Drag right at 2000 px/s for a tenth of a second.
+        for k in 1..=6 {
+            m.step(1.0 / 60.0, [100.0 + 2000.0 * k as f32 / 60.0, 50.0]);
         }
-        assert!(g.at_rest());
+        let origin_x = 100.0 + 200.0;
+        let far = m.surface(1.0, 1.0);
+        assert!(far[0] < origin_x + 800.0 - 10.0, "far corner should trail: {far:?}");
+    }
+
+    #[test]
+    fn settles_after_release() {
+        let mut m = Model::new(SpringConfig::default(), rect(), 100, 50);
+        for k in 1..=6 {
+            m.step(1.0 / 60.0, [100.0 + 2000.0 * k as f32 / 60.0, 50.0]);
+        }
+        m.release();
+        let origin = [300.0, 50.0];
+        for _ in 0..600 {
+            m.step(1.0 / 60.0, origin);
+        }
+        assert!(m.at_rest(origin));
     }
 }

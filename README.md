@@ -2,67 +2,36 @@
 
 System-wide Compiz-style wobbly windows for Windows. Drag any window on your desktop — it jiggles. Not just one app. Every app.
 
-## Status
+## How it works
 
-**Prototype architecture, built on a Mac — I cannot test it here.** The code is written against the real Win32 + DWM API via Microsoft's official `windows` Rust crate. It should compile on Windows. It'll need iteration on a Windows box.
+1. **Mouse hook** (own thread): a left press on a window's title bar is held back. If the mouse moves, it becomes a wobbly drag; if not, the click is replayed, so clicks and double-click-to-maximise still work.
+2. **Mirror**: the window is drawn into a transparent, click-through overlay as an 8×8 grid of live DWM thumbnail tiles, and the real window is parked just off-screen.
+3. **Physics**: a 4×4 grid of masses joined by springs, the same model Compiz uses. The point you grabbed sticks to the cursor; the rest trails behind. The tiles follow the Bézier surface over the masses, so the window bends.
+4. **Release**: the sheet springs back into shape, then the real window is put at the final spot and the mirror disappears.
 
-GitHub Actions builds it on `windows-latest` on every push. See `.github/workflows/build.yml`.
+## Tuning
 
-## Architecture
+Set these environment variables before starting it (no rebuild needed):
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Low-level mouse hook (WH_MOUSE_LL)                       │
-│   detects left-button-down + motion → drag start/stop    │
-└──────────┬───────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│ Window enumeration (EnumWindows + DWM filters)           │
-│   finds the top-level window under the cursor,           │
-│   skipping cloaked / tool / shell windows                │
-└──────────┬───────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│ Transparent fullscreen overlay (WS_EX_LAYERED + topmost) │
-│   click-through, no activation, no taskbar entry         │
-└──────────┬───────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│ DWM thumbnail (DwmRegisterThumbnail)                     │
-│   GPU-side mirror of the source window into the overlay  │
-│   — placed at a lagging rectangle each frame             │
-└──────────┬───────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────────────────┐
-│ Spring-mass sim (10×10 grid)                             │
-│   per-point displacement with trailing-edge weighting +  │
-│   neighbor cohesion. Centroid drives the thumbnail       │
-│   placement in v1; mesh deform via D3D11 is v2.          │
-└──────────────────────────────────────────────────────────┘
-```
+| Variable | Default | Effect |
+|---|---|---|
+| `WOBBLY_SPRING` | 2500 | Higher = stiffer, less lag |
+| `WOBBLY_FRICTION` | 14 | Lower = more jiggle after release |
+| `WOBBLY_SETTLE` | 600 | How hard it snaps back into shape after release |
+| `WOBBLY_TILES` | 8 | Tiles per side (2–16). More = smoother bends, more GPU work |
 
-## Known limits (documented, not blockers to v1)
+Logs go to `%TEMP%\wobbly-system.log`.
 
-| | Status |
+## Known limits
+
+| | |
 |---|---|
-| Single monitor only | v1 scope. Multi-monitor needs one overlay per display + per-monitor DPI |
-| Direct3D exclusive fullscreen games | They bypass DWM — can't be thumbnailed |
-| UAC-elevated windows | Can't be thumbnailed from a non-elevated process |
-| Per-monitor DPI | Manifest + `SetProcessDpiAwarenessContext` not wired yet |
-| True mesh deform | v1 lags the whole window as a single rect. v2 upgrades to D3D11 vertex-shader deform |
-| Fast-flick spring config | Spring params are hard-coded. v2 adds a settings UI |
-
-## v1 → v2 path
-
-**v1 (what's here):** DWM thumbnail with single-rect lag. Not a true wobble — a lag. Compiz-adjacent but not Compiz-identical.
-
-**v2:** Capture the source window to a D3D11 texture (via `IDXGISwapChain1` present-redirection or `Graphics.Capture.GraphicsCaptureItem` from WinRT). Render it on our overlay through a vertex shader that reads the spring grid as a vertex offset texture. That's the actual Compiz-level deform.
-
-**v3:** multi-monitor overlays, DPI awareness, user settings UI, auto-start, system tray.
+| Stepped edges | DWM thumbnails can stretch but not warp, so edges bend in small steps (one per tile). A D3D11 renderer could make them smooth curves. |
+| Maximised windows | Keep Windows' normal drag (restore on drag). |
+| Elevated (admin) windows | Can't be moved from a non-elevated process, so they keep the normal drag. Run wobbly-system as admin to include them. |
+| Aero Snap | Drag-to-edge snapping doesn't trigger during a wobbly drag. |
+| Exclusive fullscreen games | Bypass DWM entirely. |
+| Mixed-DPI monitors | The parked window sits past the right edge of the desktop; an app may rescale itself if that monitor has a different DPI. |
 
 ## Build
 
@@ -70,6 +39,8 @@ GitHub Actions builds it on `windows-latest` on every push. See `.github/workflo
 cargo build --release
 ./target/release/wobbly-system.exe
 ```
+
+Stop it with `taskkill /IM wobbly-system.exe /F`.
 
 To cross-compile from Mac/Linux you'd need the Windows GNU or MSVC targets installed. Easiest path: push, let GitHub Actions build it, download the artifact.
 
